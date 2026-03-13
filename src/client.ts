@@ -1,4 +1,5 @@
 import WebSocket from 'ws';
+import { request } from 'http';
 
 interface ClientOptions {
   target: string;
@@ -131,47 +132,126 @@ export function startClient(options: ClientOptions) {
         if (msg.type === 'request') {
           try {
             const url = localUrl + msg.path;
-            const headers = {
-              ...msg.headers,
+
+            // ────────────────────────────────────────────────────────────────
+            // ПОЛНЫЙ ДАМП ВХОДЯЩЕГО ЗАПРОСА
+            console.log(`[relay-incoming FULL DUMP]`);
+            console.log(`Method: ${msg.method}`);
+            console.log(`Path: ${msg.path}`);
+            console.log(`Request ID: ${msg.id}`);
+            console.log(`Incoming Headers (raw):`);
+            console.dir(msg.headers, { depth: null, colors: true });
+            console.log(`Incoming Body (raw, length ${msg.body?.length || 0}):`);
+            if (msg.body) {
+              console.log(msg.body);
+            } else {
+              console.log('<no body>');
+            }
+            console.log(`─`.repeat(80));
+            // ────────────────────────────────────────────────────────────────
+
+            const originalHeaders = { ...msg.headers };
+            const forwardHeaders: Record<string, string> = {
+              ...originalHeaders,
               host: `${targetHost}:${targetPort}`
             };
 
-            const response = await fetch(url, {
+            let forwardBody: string | undefined = msg.body;
+
+            // Aggressive strip for GET/HEAD
+            if (msg.method === 'GET' || msg.method === 'HEAD') {
+              if (msg.body || forwardHeaders['content-length'] || forwardHeaders['Content-Length'] || forwardHeaders['transfer-encoding']) {
+                console.log(
+                    `[relay-patch-debug] STRIPPING GET/HEAD` +
+                    ` cl: ${forwardHeaders['content-length'] || forwardHeaders['Content-Length'] || 'none'}` +
+                    ` body len: ${msg.body?.length || 0}`
+                );
+
+                // Show body content if present
+                if (msg.body) {
+                  console.log(`[relay-patch-debug] BODY BEFORE STRIP:`);
+                  console.log(msg.body);
+                }
+
+                // Force clear
+                forwardBody = undefined;
+
+                // Удаляем все возможные варианты заголовков
+                Object.keys(forwardHeaders).forEach(key => {
+                  if (key.toLowerCase() === 'content-length' || key.toLowerCase() === 'transfer-encoding') {
+                    delete forwardHeaders[key];
+                  }
+                });
+              }
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // ПОЛНЫЙ ДАМП ИСХОДЯЩЕГО ЗАПРОСА ПЕРЕД ОТПРАВКОЙ
+            console.log(`[relay-outgoing FULL DUMP]`);
+            console.log(`Method: ${msg.method}`);
+            console.log(`Path: ${msg.path}`);
+            console.log(`Outgoing Headers (after patch):`);
+            console.dir(forwardHeaders, { depth: null, colors: true });
+            console.log(`Outgoing Body (after patch, length ${forwardBody?.length || 0}):`);
+            if (forwardBody) {
+              console.log(forwardBody);
+            } else {
+              console.log('<no body>');
+            }
+            console.log(`─`.repeat(80));
+            // ────────────────────────────────────────────────────────────────
+
+            const options = {
+              hostname: targetHost,
+              port: targetPort,
+              path: msg.path,
               method: msg.method,
-              headers: headers as Headers,
-              body: msg.body || undefined,
-              redirect: 'manual'
-            });
-
-            // Read body as buffer to handle binary/large data properly
-            const arrayBuffer = await response.arrayBuffer();
-            const responseBody = Buffer.from(arrayBuffer).toString('base64');
-
-            // Convert Headers to plain object
-            const responseHeaders: Record<string, string> = {};
-            response.headers.forEach((value, key) => {
-              responseHeaders[key] = value;
-            });
-
-            const responseMessage = {
-              type: 'response',
-              id: msg.id,
-              status: response.status,
-              headers: responseHeaders,
-              body: responseBody,
-              encoding: 'base64'
+              headers: forwardHeaders
             };
 
-            const responseMessageStr = JSON.stringify(responseMessage);
+            const proxyReq = request(options, (proxyRes) => {
+              const status = proxyRes.statusCode || 200;
 
-            // Send response - add error handling for large messages
-            try {
-              ws!.send(responseMessageStr);
-              console.log(`${msg.method} ${msg.path} → ${response.status} (${Math.round(arrayBuffer.byteLength / 1024)}KB)`);
-            } catch (sendError) {
-              console.error(`Failed to send response: ${(sendError as Error).message}`);
-              console.error(`Response size: ${Math.round(arrayBuffer.byteLength / 1024)}KB, JSON size: ${Math.round(responseMessageStr.length / 1024)}KB`);
+              const responseHeaders: Record<string, string> = {};
+              Object.entries(proxyRes.headers).forEach(([key, value]) => {
+                if (typeof value === 'string') responseHeaders[key] = value;
+                else if (Array.isArray(value)) responseHeaders[key] = value.join(', ');
+              });
+
+              const chunks: Buffer[] = [];
+              proxyRes.on('data', chunk => chunks.push(Buffer.from(chunk)));
+              proxyRes.on('end', () => {
+                const arrayBuffer = Buffer.concat(chunks);
+                const responseBody = arrayBuffer.toString('base64');
+
+                ws!.send(JSON.stringify({
+                  type: 'response',
+                  id: msg.id,
+                  status,
+                  headers: responseHeaders,
+                  body: responseBody,
+                  encoding: 'base64'
+                }));
+              });
+            });
+
+            proxyReq.on('error', (err) => {
+              console.error(`Error forwarding request: ${err.message}`);
+              ws!.send(JSON.stringify({
+                type: 'response',
+                id: msg.id,
+                status: 502,
+                headers: { 'content-type': 'text/plain' },
+                body: Buffer.from(`Bad Gateway: ${err.message}`).toString('base64'),
+                encoding: 'base64'
+              }));
+            });
+
+            if (forwardBody) {
+              proxyReq.write(forwardBody);
             }
+            proxyReq.end();
+
           } catch (error) {
             const err = error as Error;
             console.error(`Error forwarding request: ${err.message}`);
